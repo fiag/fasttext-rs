@@ -855,8 +855,44 @@ impl Dictionary {
         words: &mut Vec<i32>,
         labels: &mut Vec<i32>,
     ) -> i32 {
+        // Keep this loop local: delegating to `get_line_from_str_with_scratch`
+        // costs ~20 ns per line on the inference path (measured).
         let mut word_hashes: Vec<i32> = Vec::new();
-        self.get_line_from_str_with_scratch(input, words, labels, &mut word_hashes, false)
+        let mut ntokens: i32 = 0;
+
+        words.clear();
+        labels.clear();
+
+        // Split on all whitespace (including newlines — no EOS generation here).
+        for token in input.split(|c: char| c.is_ascii_whitespace()) {
+            if token.is_empty() {
+                continue;
+            }
+
+            let h = crate::utils::hash(token.as_bytes());
+            let wid = self.get_id_with_hash(token, h).unwrap_or(-1);
+
+            let entry_type = if wid < 0 {
+                self.get_type_from_str(token)
+            } else {
+                self.get_type_by_id(wid)
+            };
+
+            ntokens += 1;
+            if entry_type == EntryType::Word {
+                self.add_subwords(words, token, wid);
+                word_hashes.push(h as i32);
+            } else if entry_type == EntryType::Label && wid >= 0 {
+                labels.push(wid - self.nwords);
+            }
+
+            if token == EOS {
+                break;
+            }
+        }
+
+        self.add_word_ngrams(words, &word_hashes, self.args.word_ngrams);
+        ntokens
     }
 
     /// Like [`Self::get_line_from_str`] but reuses caller-provided scratch and
