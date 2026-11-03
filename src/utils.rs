@@ -93,12 +93,9 @@ pub fn write_bool<W: Write>(writer: &mut W, value: bool) -> Result<()> {
 ///
 /// Callers should slice their data to the desired range before calling this function.
 pub fn softmax_in_place(data: &mut [f32]) {
-    let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut z = 0.0f32;
-    for v in data.iter_mut() {
-        *v = (*v - max).exp();
-        z += *v;
-    }
+    let max = crate::simd::max_impl(data);
+    crate::simd::exp_shifted_impl(data, max);
+    let z: f32 = data.iter().sum();
     if z > 0.0 {
         let inv_z = 1.0 / z;
         for v in data.iter_mut() {

@@ -119,6 +119,26 @@ impl Meter {
 
     // Aggregate metrics
 
+    /// Merge another meter into this one.
+    ///
+    /// Used by parallel evaluation, where each worker accumulates its own
+    /// meter and the results are combined at the end.  Per-label
+    /// `score_vs_true` entries are concatenated; the precision-recall curve
+    /// sorts scores, so insertion order does not affect results.
+    pub(crate) fn merge(&mut self, other: &Meter) {
+        self.n_examples += other.n_examples;
+        self.gold += other.gold;
+        self.predicted += other.predicted;
+        self.predicted_gold += other.predicted_gold;
+        for (&label, om) in &other.label_metrics {
+            let m = self.label_metrics.entry(label).or_default();
+            m.gold += om.gold;
+            m.predicted += om.predicted;
+            m.predicted_gold += om.predicted_gold;
+            m.score_vs_true.extend_from_slice(&om.score_vs_true);
+        }
+    }
+
     /// Number of examples added to the meter.
     pub fn n_examples(&self) -> u64 {
         self.n_examples

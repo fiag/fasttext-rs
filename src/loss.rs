@@ -173,6 +173,25 @@ pub fn find_k_best(k: usize, threshold: f32, heap: &mut Predictions, output: &Ve
     if k == 0 {
         return;
     }
+    if k == 1 {
+        // Specialized single-scan path: avoids the heap allocation and the
+        // O(log k) bookkeeping when only the best label is requested.
+        let mut best = f32::NEG_INFINITY;
+        let mut best_idx = -1i32;
+        for (i, &score) in output.data().iter().enumerate() {
+            if score < threshold {
+                continue;
+            }
+            if score > best {
+                best = score;
+                best_idx = i as i32;
+            }
+        }
+        if best_idx >= 0 {
+            heap.push((std_log(best), best_idx));
+        }
+        return;
+    }
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -265,9 +284,13 @@ impl BinaryLogisticBase {
     /// Compute output[i] = sigmoid(wo[i] · hidden) for all i.
     pub fn compute_output_sigmoid(&self, state: &mut State) {
         let osz = self.wo.rows() as usize;
-        for (i, out) in state.output.data_mut()[..osz].iter_mut().enumerate() {
-            let dot = self.wo.dot_row(&state.hidden, i as i64);
-            *out = self.tables.sigmoid(dot);
+        let cols = self.wo.cols() as usize;
+        let hidden = state.hidden.data();
+        let wo_data = self.wo.data();
+        let out = state.output.data_mut();
+        crate::simd::gemv_impl(wo_data, cols, hidden, &mut out[..osz]);
+        for out_i in out[..osz].iter_mut() {
+            *out_i = self.tables.sigmoid(*out_i);
         }
     }
 }
@@ -680,6 +703,75 @@ impl SoftmaxLoss {
     pub fn new(wo: Arc<DenseMatrix>, tables: Arc<LossTables>) -> Self {
         SoftmaxLoss { tables, wo }
     }
+
+    /// Fused softmax + top-k prediction.
+    ///
+    /// Computes the logits, applies softmax, and selects the top-k entries in
+    /// a single pass over the output layer.  This avoids normalizing the whole
+    /// output vector and then scanning it again.  Only the surviving top-k
+    /// entries are normalized and converted to log-probabilities.
+    fn softmax_predict(&self, k: usize, threshold: f32, heap: &mut Predictions, state: &mut State) {
+        let osz = self.wo.rows() as usize;
+        if osz == 0 || k == 0 {
+            return;
+        }
+        let cols = self.wo.cols() as usize;
+        let hidden = state.hidden.data();
+        let wo_data = self.wo.data();
+        let out = state.output.data_mut();
+        crate::simd::gemv_impl(wo_data, cols, hidden, &mut out[..osz]);
+
+        let slice = &mut out[..osz];
+        let max = crate::simd::max_impl(slice);
+        crate::simd::exp_shifted_impl(slice, max);
+        let mut sum = 0.0f32;
+
+        if k == 1 {
+            // Single pass: accumulate the softmax denominator and track the
+            // maximum in one scan.
+            let mut best = f32::NEG_INFINITY;
+            let mut best_idx = 0usize;
+            for (i, &e) in slice.iter().enumerate() {
+                sum += e;
+                if e > best {
+                    best = e;
+                    best_idx = i;
+                }
+            }
+            let prob = if sum > 0.0 { best / sum } else { 0.0 };
+            if prob >= threshold {
+                heap.push((std_log(prob), best_idx as i32));
+            }
+            return;
+        }
+
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut min_heap: BinaryHeap<Reverse<(OrdF32, i32)>> = BinaryHeap::with_capacity(k + 1);
+        for (i, &e) in slice.iter().enumerate() {
+            sum += e;
+            if min_heap.len() == k && e <= min_heap.peek().unwrap().0 .0 .0 {
+                continue;
+            }
+            min_heap.push(Reverse((OrdF32(e), i as i32)));
+            if min_heap.len() > k {
+                min_heap.pop();
+            }
+        }
+        if sum <= 0.0 {
+            return;
+        }
+        let inv_sum = 1.0 / sum;
+        heap.extend(
+            min_heap
+                .into_iter()
+                .filter_map(|Reverse((OrdF32(raw), idx))| {
+                    let prob = raw * inv_sum;
+                    (prob >= threshold).then(|| (std_log(prob), idx))
+                }),
+        );
+        heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    }
 }
 
 impl Loss for SoftmaxLoss {
@@ -722,12 +814,12 @@ impl Loss for SoftmaxLoss {
         let wo_data = self.wo.data();
         let out = state.output.data_mut();
         // Compute raw logits: output[i] = wo[i] · hidden
-        for (i, out_i) in out[..osz].iter_mut().enumerate() {
-            let row_start = i * cols;
-            let row = &wo_data[row_start..row_start + cols];
-            *out_i = row.iter().zip(hidden.iter()).map(|(&a, &b)| a * b).sum();
-        }
+        crate::simd::gemv_impl(wo_data, cols, hidden, &mut out[..osz]);
         utils::softmax_in_place(&mut out[..osz]);
+    }
+
+    fn predict(&self, k: i32, threshold: f32, heap: &mut Predictions, state: &mut State) {
+        self.softmax_predict(k as usize, threshold, heap, state);
     }
 }
 

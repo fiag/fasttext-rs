@@ -1,4 +1,6 @@
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
+
+use rayon::prelude::*;
 
 use crate::args::LossName;
 use crate::dictionary::EOS;
@@ -214,47 +216,97 @@ impl FastText {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(FastTextError::IoError)?;
-        let mut buf_reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .map_err(FastTextError::IoError)?;
 
-        let mut meter = Meter::new();
-        let mut words: Vec<i32> = Vec::new();
-        let mut labels: Vec<i32> = Vec::new();
-        let mut pending_newline = false;
-        let mut word_hashes: Vec<i32> = Vec::new();
-        let mut token = String::new();
-        let mut state = State::new(dim, nlabels, 0);
-
-        loop {
-            let ntokens = self.dict.get_line_with_scratch(
-                &mut buf_reader,
-                &mut words,
-                &mut labels,
-                &mut word_hashes,
-                &mut token,
-                &mut pending_newline,
-            );
-            if ntokens == 0 && words.is_empty() && labels.is_empty() {
-                break;
+        // Split the input into line-aligned chunks and evaluate them in
+        // parallel.  Each chunk mirrors the streaming tokenizer: a trailing
+        // newline contributes an EOS token, while a final line without a
+        // newline (EOF) does not.
+        let nthreads = rayon::current_num_threads().max(1);
+        let mut starts = Vec::with_capacity(nthreads + 1);
+        starts.push(0usize);
+        for i in 1..nthreads {
+            let raw = buf.len() * i / nthreads;
+            let prev = *starts.last().unwrap();
+            if raw <= prev {
+                continue;
             }
-
-            if !labels.is_empty() && !words.is_empty() {
-                let raw = if self.quant {
-                    self.predict_raw_quantized(&words, k_eff, effective_threshold, &mut state)
-                } else {
-                    self.model
-                        .predict(&words, k_eff, effective_threshold, &mut state)
-                };
-
-                // Convert log-probs to probabilities (matching C++ `min(exp(score), 1.0)`).
-                let predictions: Vec<(f32, i32)> = raw
-                    .into_iter()
-                    .map(|(log_prob, label_idx)| (log_prob.exp().min(1.0), label_idx))
-                    .collect();
-
-                meter.add(&predictions, &labels, k_eff as usize);
+            let next = match buf[raw..].iter().position(|&b| b == b'\n') {
+                Some(off) => raw + off + 1,
+                None => buf.len(),
+            };
+            if next > prev {
+                starts.push(next);
             }
         }
+        if *starts.last().unwrap() < buf.len() {
+            starts.push(buf.len());
+        }
 
+        let meters: Vec<Meter> = starts
+            .par_windows(2)
+            .map(|chunk| {
+                let (start, end) = (chunk[0], chunk[1]);
+                let mut meter = Meter::new();
+                let mut words: Vec<i32> = Vec::with_capacity(64);
+                let mut labels: Vec<i32> = Vec::new();
+                let mut word_hashes: Vec<i32> = Vec::new();
+                let mut state = State::new(dim, nlabels, 0);
+                let mut pos = start;
+                while pos < end {
+                    let (line_end, has_newline) =
+                        match buf[pos..end].iter().position(|&b| b == b'\n') {
+                            Some(off) => (pos + off, true),
+                            None => (end, false),
+                        };
+                    if line_end > pos {
+                        let mut text = String::from_utf8_lossy(&buf[pos..line_end]).into_owned();
+                        if has_newline {
+                            text.push(' ');
+                            text.push_str(EOS);
+                        }
+                        self.dict.get_line_from_str_with_scratch(
+                            &text,
+                            &mut words,
+                            &mut labels,
+                            &mut word_hashes,
+                        );
+
+                        if !labels.is_empty() && !words.is_empty() {
+                            let raw = if self.quant {
+                                self.predict_raw_quantized(
+                                    &words,
+                                    k_eff,
+                                    effective_threshold,
+                                    &mut state,
+                                )
+                            } else {
+                                self.model
+                                    .predict(&words, k_eff, effective_threshold, &mut state)
+                            };
+
+                            // Convert log-probs to probabilities (matching C++ `min(exp(score), 1.0)`).
+                            let predictions: Vec<(f32, i32)> = raw
+                                .into_iter()
+                                .map(|(log_prob, label_idx)| (log_prob.exp().min(1.0), label_idx))
+                                .collect();
+
+                            meter.add(&predictions, &labels, k_eff as usize);
+                        }
+                    }
+                    pos = if has_newline { line_end + 1 } else { end };
+                }
+                meter
+            })
+            .collect();
+
+        let mut meter = Meter::new();
+        for m in meters {
+            meter.merge(&m);
+        }
         Ok(meter)
     }
 }

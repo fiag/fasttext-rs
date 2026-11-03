@@ -44,36 +44,44 @@ impl FastText {
     ///
     /// Used as a precomputation step for nearest-neighbor and analogy queries.
     pub fn precompute_word_vectors(&self) -> DenseMatrix {
+        use rayon::prelude::*;
+
         let nwords = self.dict.nwords() as usize;
         let dim = self.args.dim as i64;
         let dim_usize = dim as usize;
         let mut word_vectors = DenseMatrix::new(nwords as i64, dim);
-        for i in 0..nwords {
-            let word = self.dict.get_word(i as i32);
-            let ids = self.dict.get_subwords_for_string(word);
-            if ids.is_empty() {
-                continue;
-            }
-            let row = word_vectors.row_mut(i as i64);
-            let scale = 1.0 / ids.len() as f32;
-            if self.quant {
-                if let Some(ref qi) = self.quant_input {
-                    let mut vec = Vector::new(dim_usize);
-                    for &id in &ids {
-                        qi.add_row_to_vector(&mut vec, id, scale);
-                    }
-                    row.copy_from_slice(vec.data());
-                }
-            } else {
-                for &id in &ids {
-                    let input_row = self.input.row(id as i64);
-                    for (r, &v) in row.iter_mut().zip(input_row.iter()) {
-                        *r += v * scale;
-                    }
-                }
-            }
-            utils::l2_normalize(row);
+        if nwords == 0 || dim_usize == 0 {
+            return word_vectors;
         }
+
+        // Each row is independent; parallelize across the vocabulary.
+        word_vectors
+            .data_mut()
+            .par_chunks_mut(dim_usize)
+            .enumerate()
+            .for_each(|(i, row)| {
+                let word = self.dict.get_word(i as i32);
+                let ids = self.dict.get_subwords_for_string_cow(word);
+                if ids.is_empty() {
+                    return;
+                }
+                let scale = 1.0 / ids.len() as f32;
+                if self.quant {
+                    if let Some(ref qi) = self.quant_input {
+                        let mut vec = Vector::new(dim_usize);
+                        for &id in ids.iter() {
+                            qi.add_row_to_vector(&mut vec, id, scale);
+                        }
+                        row.copy_from_slice(vec.data());
+                    }
+                } else {
+                    for &id in ids.iter() {
+                        let input_row = self.input.row(id as i64);
+                        crate::simd::add_vector_impl(row, input_row, scale);
+                    }
+                }
+                utils::l2_normalize(row);
+            });
         word_vectors
     }
 
@@ -202,17 +210,19 @@ impl FastText {
         let wv_data = word_vectors.data();
         let mut heap: BinaryHeap<Reverse<(OrdF32, usize)>> = BinaryHeap::with_capacity(k + 1);
 
+        // Map banned words to IDs once instead of comparing strings per row.
+        let ban_ids: Vec<usize> = ban_words
+            .iter()
+            .filter_map(|w| self.dict.get_id(w))
+            .map(|id| id as usize)
+            .collect();
+
         for i in 0..nwords {
-            let word = self.dict.get_word(i as i32);
-            if ban_words.contains(&word) {
+            if ban_ids.contains(&i) {
                 continue;
             }
             let row = &wv_data[i * dim..(i + 1) * dim];
-            let sim: f32 = normalized_query
-                .iter()
-                .zip(row.iter())
-                .map(|(&q, &r)| q * r)
-                .sum();
+            let sim = crate::simd::dot_impl(&normalized_query, row);
 
             if heap.len() == k && sim <= heap.peek().unwrap().0 .0 .0 {
                 continue;

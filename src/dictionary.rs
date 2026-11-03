@@ -1,5 +1,6 @@
 // Dictionary: tokenization, vocabulary, subwords, word n-grams, hash table
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -707,6 +708,19 @@ impl Dictionary {
         ngrams
     }
 
+    /// Get subword n-gram IDs for a word, borrowing the cached entries when
+    /// the word is in vocabulary.
+    ///
+    /// This is the allocation-free variant of [`Self::get_subwords_for_string`];
+    /// in-vocabulary lookups (the common inference path) return a borrowed
+    /// slice, and only out-of-vocabulary words allocate.
+    pub fn get_subwords_for_string_cow<'a>(&'a self, word: &str) -> Cow<'a, [i32]> {
+        if let Some(id) = self.get_id(word) {
+            return Cow::Borrowed(&self.words[id as usize].subwords);
+        }
+        Cow::Owned(self.get_subwords_for_string(word))
+    }
+
     /// Get n-gram subwords with their string representations.
     ///
     /// Returns a vec of `(id, ngram_string)` pairs:
@@ -845,6 +859,20 @@ impl Dictionary {
         labels: &mut Vec<i32>,
     ) -> i32 {
         let mut word_hashes: Vec<i32> = Vec::new();
+        self.get_line_from_str_with_scratch(input, words, labels, &mut word_hashes)
+    }
+
+    /// Like [`Self::get_line_from_str`] but reuses a caller-provided
+    /// `word_hashes` scratch buffer, avoiding a per-line allocation on the
+    /// parallel evaluation path.
+    pub fn get_line_from_str_with_scratch(
+        &self,
+        input: &str,
+        words: &mut Vec<i32>,
+        labels: &mut Vec<i32>,
+        word_hashes: &mut Vec<i32>,
+    ) -> i32 {
+        word_hashes.clear();
         let mut ntokens: i32 = 0;
 
         words.clear();
@@ -878,7 +906,7 @@ impl Dictionary {
             }
         }
 
-        self.add_word_ngrams(words, &word_hashes, self.args.word_ngrams);
+        self.add_word_ngrams(words, word_hashes, self.args.word_ngrams);
         ntokens
     }
 

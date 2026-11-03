@@ -228,15 +228,30 @@ impl DenseMatrix {
     ///
     /// Uses the C++ fastText approach: divide data into 10 blocks,
     /// each seeded with `block_index + seed` using minstd_rand (LCG).
+    /// Blocks are independent, so they are filled in parallel.
     pub fn uniform(&mut self, a: f32, seed: i32) {
+        use rayon::prelude::*;
+
         let total = self.data().len();
         if total == 0 {
             return;
         }
         let block_size = total / 10;
-        let data = self.data_mut();
 
-        for block in 0..10 {
+        // Wrap the raw pointer so disjoint block writes can be shared across
+        // rayon tasks.  Each task writes only its own non-overlapping range.
+        struct SendPtr(*mut f32);
+        // SAFETY: tasks only write disjoint ranges of the owned allocation.
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+        impl SendPtr {
+            fn get(&self) -> *mut f32 {
+                self.0
+            }
+        }
+        let base = SendPtr(self.ptr);
+
+        (0..10).into_par_iter().for_each(|block| {
             let start = block_size * block;
             let end = if block == 9 {
                 total
@@ -245,12 +260,15 @@ impl DenseMatrix {
             };
             // Seed matches C++: std::minstd_rand rng(block + seed)
             let mut rng = MinstdRng::new((block as u64).wrapping_add(seed as u32 as u64));
-            for item in data.iter_mut().take(end).skip(start) {
+            // SAFETY: `start..end` are disjoint for each block and in bounds.
+            let data =
+                unsafe { std::slice::from_raw_parts_mut(base.get().add(start), end - start) };
+            for item in data {
                 // uniform_real() returns [0, 1), map to [-a, a]
                 let u = rng.uniform_real();
                 *item = (u * 2.0 * a as f64 - a as f64) as f32;
             }
-        }
+        });
     }
 
     /// Compute the L2 norm of row `i`.

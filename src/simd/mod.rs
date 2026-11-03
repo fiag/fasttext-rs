@@ -44,6 +44,42 @@ pub(crate) fn add_vector_scalar(dest: &mut [f32], src: &[f32], scale: f32) {
         .for_each(|(d, &s)| *d += scale * s);
 }
 
+/// Scalar fallback for matrix-vector product `out[i] = dot(mat[i], x)`.
+///
+/// Four rows are processed per iteration so the compiler can keep four
+/// independent accumulator chains (and shared `x` loads) in registers.
+#[allow(dead_code)]
+pub(crate) fn gemv_scalar(mat: &[f32], cols: usize, x: &[f32], out: &mut [f32]) {
+    let n = out.len();
+    if cols == 0 || n == 0 {
+        return;
+    }
+    let mut i = 0;
+    while i + 4 <= n {
+        let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let r0 = &mat[i * cols..];
+        let r1 = &mat[(i + 1) * cols..];
+        let r2 = &mat[(i + 2) * cols..];
+        let r3 = &mat[(i + 3) * cols..];
+        for j in 0..cols {
+            let xv = x[j];
+            s0 += r0[j] * xv;
+            s1 += r1[j] * xv;
+            s2 += r2[j] * xv;
+            s3 += r3[j] * xv;
+        }
+        out[i] = s0;
+        out[i + 1] = s1;
+        out[i + 2] = s2;
+        out[i + 3] = s3;
+        i += 4;
+    }
+    while i < n {
+        out[i] = dot_scalar(&mat[i * cols..(i + 1) * cols], x);
+        i += 1;
+    }
+}
+
 /// Scalar average_rows implementation.
 #[allow(dead_code)]
 pub(crate) fn average_rows_scalar(x: &mut Vector, rows: &[i32], mat: &DenseMatrix) {
@@ -106,6 +142,47 @@ pub(crate) fn add_vector_impl(dest: &mut [f32], src: &[f32], scale: f32) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         add_vector_scalar(dest, src, scale)
+    }
+}
+
+/// Dispatch matrix-vector product to the best available implementation.
+#[inline]
+pub(crate) fn gemv_impl(mat: &[f32], cols: usize, x: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::gemv(mat, cols, x, out);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        gemv_scalar(mat, cols, x, out);
+    }
+}
+
+/// Dispatch maximum-value scan to the best available implementation.
+#[inline]
+pub(crate) fn max_impl(data: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::max_value(data)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        data.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+    }
+}
+
+/// Dispatch in-place shifted exponential to the best available implementation.
+#[inline]
+pub(crate) fn exp_shifted_impl(data: &mut [f32], shift: f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::exp_shifted_in_place(data, shift);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for v in data.iter_mut() {
+            *v = (*v - shift).exp();
+        }
     }
 }
 

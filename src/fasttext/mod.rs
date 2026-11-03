@@ -438,7 +438,7 @@ impl FastText {
             "output buffer length must equal model dimension"
         );
         out.fill(0.0);
-        let ids = self.dict.get_subwords_for_string(word);
+        let ids = self.dict.get_subwords_for_string_cow(word);
         if ids.is_empty() {
             return;
         }
@@ -446,17 +446,15 @@ impl FastText {
         if self.quant {
             if let Some(ref qi) = self.quant_input {
                 let mut vec = Vector::new(dim);
-                for &id in &ids {
+                for &id in ids.iter() {
                     qi.add_row_to_vector(&mut vec, id, scale);
                 }
                 out.copy_from_slice(vec.data());
             }
         } else {
-            for &id in &ids {
+            for &id in ids.iter() {
                 let row = self.input.row(id as i64);
-                for (r, &v) in out.iter_mut().zip(row.iter()) {
-                    *r += v * scale;
-                }
+                crate::simd::add_vector_impl(out, row, scale);
             }
         }
     }
@@ -508,9 +506,7 @@ impl FastText {
         } else {
             for &id in &words {
                 let row = self.input.row(id as i64);
-                for (r, &v) in out.iter_mut().zip(row.iter()) {
-                    *r += v;
-                }
+                crate::simd::add_vector_impl(out, row, 1.0);
             }
             for r in out.iter_mut() {
                 *r /= count;
@@ -525,11 +521,9 @@ impl FastText {
         let mut count = 0i32;
         for word in sentence.split_whitespace() {
             self.get_word_vector_into(word, &mut word_buf);
-            let norm: f32 = word_buf.iter().map(|&v| v * v).sum::<f32>().sqrt();
+            let norm = crate::simd::dot_impl(&word_buf, &word_buf).sqrt();
             if norm > 0.0 {
-                for (r, &v) in out.iter_mut().zip(word_buf.iter()) {
-                    *r += v / norm;
-                }
+                crate::simd::add_vector_impl(out, &word_buf, 1.0 / norm);
                 count += 1;
             }
         }
