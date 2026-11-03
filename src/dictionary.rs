@@ -697,15 +697,7 @@ impl Dictionary {
     /// - OOV: computes n-grams on-the-fly (no word ID prepended).
     /// - EOS: returns empty vec if OOV.
     pub fn get_subwords_for_string(&self, word: &str) -> Vec<i32> {
-        if let Some(id) = self.get_id(word) {
-            return self.words[id as usize].subwords.clone();
-        }
-        let mut ngrams = Vec::new();
-        if word != EOS {
-            let word_with_markers = format!("{}{}{}", BOW, word, EOW);
-            self.compute_subwords(&word_with_markers, &mut ngrams);
-        }
-        ngrams
+        self.get_subwords_for_string_cow(word).into_owned()
     }
 
     /// Get subword n-gram IDs for a word, borrowing the cached entries when
@@ -716,9 +708,14 @@ impl Dictionary {
     /// slice, and only out-of-vocabulary words allocate.
     pub fn get_subwords_for_string_cow<'a>(&'a self, word: &str) -> Cow<'a, [i32]> {
         if let Some(id) = self.get_id(word) {
-            return Cow::Borrowed(&self.words[id as usize].subwords);
+            return Cow::Borrowed(self.get_subwords(id));
         }
-        Cow::Owned(self.get_subwords_for_string(word))
+        let mut ngrams = Vec::new();
+        if word != EOS {
+            let word_with_markers = format!("{}{}{}", BOW, word, EOW);
+            self.compute_subwords(&word_with_markers, &mut ngrams);
+        }
+        Cow::Owned(ngrams)
     }
 
     /// Get n-gram subwords with their string representations.
@@ -859,18 +856,23 @@ impl Dictionary {
         labels: &mut Vec<i32>,
     ) -> i32 {
         let mut word_hashes: Vec<i32> = Vec::new();
-        self.get_line_from_str_with_scratch(input, words, labels, &mut word_hashes)
+        self.get_line_from_str_with_scratch(input, words, labels, &mut word_hashes, false)
     }
 
-    /// Like [`Self::get_line_from_str`] but reuses a caller-provided
-    /// `word_hashes` scratch buffer, avoiding a per-line allocation on the
-    /// parallel evaluation path.
+    /// Like [`Self::get_line_from_str`] but reuses caller-provided scratch and
+    /// can append the EOS token that a trailing newline produces in the
+    /// streaming tokenizer.
+    ///
+    /// Passing `append_eos = true` reproduces the stream behavior for a line
+    /// that ended with a newline; the final line of a file (no trailing
+    /// newline) passes `false`.
     pub fn get_line_from_str_with_scratch(
         &self,
         input: &str,
         words: &mut Vec<i32>,
         labels: &mut Vec<i32>,
         word_hashes: &mut Vec<i32>,
+        append_eos: bool,
     ) -> i32 {
         word_hashes.clear();
         let mut ntokens: i32 = 0;
@@ -879,35 +881,50 @@ impl Dictionary {
         labels.clear();
 
         // Split on all whitespace (including newlines — no EOS generation here).
+        let mut saw_eos = false;
         for token in input.split(|c: char| c.is_ascii_whitespace()) {
             if token.is_empty() {
                 continue;
             }
-
-            let h = crate::utils::hash(token.as_bytes());
-            let wid = self.get_id_with_hash(token, h).unwrap_or(-1);
-
-            let entry_type = if wid < 0 {
-                self.get_type_from_str(token)
-            } else {
-                self.get_type_by_id(wid)
-            };
-
-            ntokens += 1;
-            if entry_type == EntryType::Word {
-                self.add_subwords(words, token, wid);
-                word_hashes.push(h as i32);
-            } else if entry_type == EntryType::Label && wid >= 0 {
-                labels.push(wid - self.nwords);
-            }
-
+            ntokens += self.push_token(token, words, labels, word_hashes);
             if token == EOS {
+                saw_eos = true;
                 break;
             }
         }
 
+        if append_eos && !saw_eos {
+            ntokens += self.push_token(EOS, words, labels, word_hashes);
+        }
+
         self.add_word_ngrams(words, word_hashes, self.args.word_ngrams);
         ntokens
+    }
+
+    /// Append one token's word/label entry. Returns 1 so callers can count tokens.
+    fn push_token(
+        &self,
+        token: &str,
+        words: &mut Vec<i32>,
+        labels: &mut Vec<i32>,
+        word_hashes: &mut Vec<i32>,
+    ) -> i32 {
+        let h = crate::utils::hash(token.as_bytes());
+        let wid = self.get_id_with_hash(token, h).unwrap_or(-1);
+
+        let entry_type = if wid < 0 {
+            self.get_type_from_str(token)
+        } else {
+            self.get_type_by_id(wid)
+        };
+
+        if entry_type == EntryType::Word {
+            self.add_subwords(words, token, wid);
+            word_hashes.push(h as i32);
+        } else if entry_type == EntryType::Label && wid >= 0 {
+            labels.push(wid - self.nwords);
+        }
+        1
     }
 
     /// Get the discard probability for a vocabulary entry.

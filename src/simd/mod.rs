@@ -158,6 +158,19 @@ pub(crate) fn gemv_impl(mat: &[f32], cols: usize, x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Dispatch slice sum to the best available implementation.
+#[inline]
+pub(crate) fn sum_impl(data: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        neon::sum_value(data)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        data.iter().sum()
+    }
+}
+
 /// Dispatch maximum-value scan to the best available implementation.
 #[inline]
 pub(crate) fn max_impl(data: &[f32]) -> f32 {

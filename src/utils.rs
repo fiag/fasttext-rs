@@ -93,9 +93,7 @@ pub fn write_bool<W: Write>(writer: &mut W, value: bool) -> Result<()> {
 ///
 /// Callers should slice their data to the desired range before calling this function.
 pub fn softmax_in_place(data: &mut [f32]) {
-    let max = crate::simd::max_impl(data);
-    crate::simd::exp_shifted_impl(data, max);
-    let z: f32 = data.iter().sum();
+    let z = softmax_exp_in_place(data);
     if z > 0.0 {
         let inv_z = 1.0 / z;
         for v in data.iter_mut() {
@@ -104,9 +102,21 @@ pub fn softmax_in_place(data: &mut [f32]) {
     }
 }
 
+/// Replace `data` with `exp(data - max(data))` and return the sum.
+///
+/// Shares the max/exp primitives with [`softmax_in_place`]; callers that need
+/// the unnormalized weights (for example to select the top-k before scaling)
+/// can normalize only the surviving entries afterwards.
+#[inline]
+pub fn softmax_exp_in_place(data: &mut [f32]) -> f32 {
+    let max = crate::simd::max_impl(data);
+    crate::simd::exp_shifted_impl(data, max);
+    crate::simd::sum_impl(data)
+}
+
 /// L2-normalize a slice in-place. If the norm is below `1e-8`, the slice is left unchanged.
 pub fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    let norm = crate::simd::dot_impl(v, v).sqrt();
     if norm < 1e-8 {
         return;
     }

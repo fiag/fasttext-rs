@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Read, Seek, SeekFrom};
 
 use rayon::prelude::*;
@@ -216,20 +217,24 @@ impl FastText {
         reader
             .seek(SeekFrom::Start(0))
             .map_err(FastTextError::IoError)?;
-        let mut buf = Vec::new();
+        let len = reader
+            .seek(SeekFrom::End(0))
+            .map_err(FastTextError::IoError)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(FastTextError::IoError)?;
+        let mut buf = Vec::with_capacity(len as usize);
         reader
             .read_to_end(&mut buf)
             .map_err(FastTextError::IoError)?;
 
         // Split the input into line-aligned chunks and evaluate them in
-        // parallel.  Each chunk mirrors the streaming tokenizer: a trailing
-        // newline contributes an EOS token, while a final line without a
-        // newline (EOF) does not.
-        let nthreads = rayon::current_num_threads().max(1);
-        let mut starts = Vec::with_capacity(nthreads + 1);
+        // parallel.  More chunks than threads lets rayon balance uneven lines.
+        let nchunks = (rayon::current_num_threads().max(1) * 4).max(1);
+        let mut starts = Vec::with_capacity(nchunks + 1);
         starts.push(0usize);
-        for i in 1..nthreads {
-            let raw = buf.len() * i / nthreads;
+        for i in 1..nchunks {
+            let raw = buf.len() * i / nchunks;
             let prev = *starts.last().unwrap();
             if raw <= prev {
                 continue;
@@ -246,7 +251,7 @@ impl FastText {
             starts.push(buf.len());
         }
 
-        let meters: Vec<Meter> = starts
+        let meter = starts
             .par_windows(2)
             .map(|chunk| {
                 let (start, end) = (chunk[0], chunk[1]);
@@ -263,16 +268,19 @@ impl FastText {
                             None => (end, false),
                         };
                     if line_end > pos {
-                        let mut text = String::from_utf8_lossy(&buf[pos..line_end]).into_owned();
-                        if has_newline {
-                            text.push(' ');
-                            text.push_str(EOS);
-                        }
+                        let bytes = &buf[pos..line_end];
+                        // Valid UTF-8 tokenizes borrow-free; only malformed
+                        // input falls back to the lossy owned string.
+                        let text: Cow<str> = match std::str::from_utf8(bytes) {
+                            Ok(s) => Cow::Borrowed(s),
+                            Err(_) => String::from_utf8_lossy(bytes),
+                        };
                         self.dict.get_line_from_str_with_scratch(
                             &text,
                             &mut words,
                             &mut labels,
                             &mut word_hashes,
+                            has_newline,
                         );
 
                         if !labels.is_empty() && !words.is_empty() {
@@ -301,12 +309,11 @@ impl FastText {
                 }
                 meter
             })
-            .collect();
+            .reduce(Meter::new, |mut acc, m| {
+                acc.merge(&m);
+                acc
+            });
 
-        let mut meter = Meter::new();
-        for m in meters {
-            meter.merge(&m);
-        }
         Ok(meter)
     }
 }

@@ -238,37 +238,48 @@ impl DenseMatrix {
         }
         let block_size = total / 10;
 
-        // Wrap the raw pointer so disjoint block writes can be shared across
-        // rayon tasks.  Each task writes only its own non-overlapping range.
-        struct SendPtr(*mut f32);
-        // SAFETY: tasks only write disjoint ranges of the owned allocation.
-        unsafe impl Send for SendPtr {}
-        unsafe impl Sync for SendPtr {}
-        impl SendPtr {
-            fn get(&self) -> *mut f32 {
-                self.0
-            }
+        // Split the buffer into the same 10 blocks the C++ implementation
+        // uses; all blocks are disjoint, so they can be filled in parallel.
+        let mut blocks: Vec<&mut [f32]> = Vec::with_capacity(10);
+        let mut rest = self.data_mut();
+        for _ in 0..9 {
+            let (head, tail) = rest.split_at_mut(block_size);
+            blocks.push(head);
+            rest = tail;
         }
-        let base = SendPtr(self.ptr);
+        blocks.push(rest);
 
-        (0..10).into_par_iter().for_each(|block| {
-            let start = block_size * block;
-            let end = if block == 9 {
-                total
-            } else {
-                (block_size * (block + 1)).min(total)
-            };
-            // Seed matches C++: std::minstd_rand rng(block + seed)
-            let mut rng = MinstdRng::new((block as u64).wrapping_add(seed as u32 as u64));
-            // SAFETY: `start..end` are disjoint for each block and in bounds.
-            let data =
-                unsafe { std::slice::from_raw_parts_mut(base.get().add(start), end - start) };
-            for item in data {
-                // uniform_real() returns [0, 1), map to [-a, a]
-                let u = rng.uniform_real();
-                *item = (u * 2.0 * a as f64 - a as f64) as f32;
-            }
-        });
+        blocks
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(block, data)| {
+                // Seed matches C++: std::minstd_rand rng(block + seed)
+                let mut rng = MinstdRng::new((block as u64).wrapping_add(seed as u32 as u64));
+                for item in data {
+                    // uniform_real() returns [0, 1), map to [-a, a]
+                    let u = rng.uniform_real();
+                    *item = (u * 2.0 * a as f64 - a as f64) as f32;
+                }
+            });
+    }
+
+    /// Compute `out[i] = dot(row_i, x)` for every row of this matrix.
+    ///
+    /// `x` must have exactly `cols` elements and `out` exactly `rows`
+    /// elements.  This is the output-layer kernel used by prediction.
+    #[inline]
+    pub fn gemv_into(&self, x: &[f32], out: &mut [f32]) {
+        assert_eq!(
+            x.len(),
+            self.n as usize,
+            "vector length must equal matrix columns"
+        );
+        assert_eq!(
+            out.len(),
+            self.m as usize,
+            "output length must equal matrix rows"
+        );
+        crate::simd::gemv_impl(self.data(), self.n as usize, x, out);
     }
 
     /// Compute the L2 norm of row `i`.

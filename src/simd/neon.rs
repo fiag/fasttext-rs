@@ -185,6 +185,25 @@ pub(crate) fn gemv(mat: &[f32], cols: usize, x: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Sum of a slice.
+pub(crate) fn sum_value(data: &[f32]) -> f32 {
+    let n = data.len();
+    let mut i = 0;
+    unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        while i + 4 <= n {
+            acc = vaddq_f32(acc, vld1q_f32(data.as_ptr().add(i)));
+            i += 4;
+        }
+        let mut result = vaddvq_f32(acc);
+        while i < n {
+            result += data[i];
+            i += 1;
+        }
+        result
+    }
+}
+
 /// Maximum value in a slice (NaN is ignored, matching `f32::max` folding).
 pub(crate) fn max_value(data: &[f32]) -> f32 {
     let n = data.len();
